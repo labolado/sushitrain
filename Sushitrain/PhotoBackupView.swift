@@ -102,6 +102,7 @@ struct PhotoBackupSettingsView: View {
 	@State private var folders: [SushitrainFolder] = []
 	@State private var albums: [PHAssetCollection] = []
 	@State private var smartAlbums: [PHAssetCollection] = []
+	@State private var showAdvancedOptions = false
 
 	var body: some View {
 		Form {
@@ -113,25 +114,52 @@ struct PhotoBackupSettingsView: View {
 
 			Section {
 				if authorizationStatus == .authorized {
-					Picker("From album", selection: $photoBackup.selectedAlbumID) {
-						Text("None").tag("")
-						Text("Camera roll").tag(PhotoBackup.allPhotosAlbumIdentifier)
-
-						Section("Albums") {
-							ForEach(albums, id: \.localIdentifier) { album in
-								Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
-							}
+					// Auto mode toggle
+					Toggle("Automatically back up all albums", isOn: $photoBackup.autoModeEnabled)
+						.disabled(photoBackup.isBackingUp)
+						.onChange(of: photoBackup.autoModeEnabled) { _, _ in
+							photoBackup.resetLastSuccessfulChangeToken()
 						}
 
-						Section("Smart albums") {
-							ForEach(smartAlbums, id: \.localIdentifier) { album in
-								Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
+					if photoBackup.autoModeEnabled {
+						Text("All albums will be backed up to subdirectories organized by album name. New albums will be automatically included.")
+							.font(.caption)
+							.foregroundStyle(.secondary)
+						.padding(.top, 4)
+					}
+
+					// Manual mode: show album picker
+					if !photoBackup.autoModeEnabled {
+						Picker("From album", selection: $photoBackup.selectedAlbumID) {
+							Text("None").tag("")
+							Text("Camera roll").tag(PhotoBackup.allPhotosAlbumIdentifier)
+
+							Section("Albums") {
+								ForEach(albums, id: \.localIdentifier) { album in
+									Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
+								}
 							}
+
+							Section("Smart albums") {
+								ForEach(smartAlbums, id: \.localIdentifier) { album in
+									Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
+								}
+							}
+						}
+						.pickerStyle(.menu)
+						.disabled(photoBackup.isBackingUp)
+						.onChange(of: photoBackup.selectedAlbumID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+					}
+
+					Picker("To folder", selection: $photoBackup.selectedFolderID) {
+						Text("(No folder selected)").tag("")
+						ForEach(folders, id: \.self.folderID) { option in
+							Text(option.displayName).tag(option.folderID)
 						}
 					}
 					.pickerStyle(.menu)
-					.disabled(photoBackup.isBackingUp)
-					.onChange(of: photoBackup.selectedAlbumID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+					.disabled(photoBackup.isBackingUp || (!photoBackup.autoModeEnabled && photoBackup.selectedAlbumID.isEmpty))
+					.onChange(of: photoBackup.selectedFolderID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
 				}
 				else if authorizationStatus == .denied || authorizationStatus == .restricted {
 					Text("Synctrain cannot access your photo library right now")
@@ -147,25 +175,19 @@ struct PhotoBackupSettingsView: View {
 						self.requestAuthorization()
 					}
 				}
-
-				if authorizationStatus == .authorized {
-					Picker("To folder", selection: $photoBackup.selectedFolderID) {
-						Text("(No folder selected)").tag("")
-						ForEach(folders, id: \.self.folderID) { option in
-							Text(option.displayName).tag(option.folderID)
-						}
-					}
-					.pickerStyle(.menu)
-					.disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
-					.onChange(of: photoBackup.selectedFolderID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-				}
 			} header: {
 				Text("Copy photos")
 			} footer: {
 				if photoBackup.isReady {
-					Text(
-						"Photos from the selected album will be saved in the selected folder, in sub folders by creation date. If a photo with the same file name already exists in the folder, or has been deleted from the folder before, it will not be saved again."
-					)
+					if photoBackup.autoModeEnabled {
+						Text(
+							"All albums will be backed up to subdirectories organized by album name. New albums are automatically included. Existing photos are not re-saved."
+						)
+					} else {
+						Text(
+							"Photos from the selected album will be saved in the selected folder, in sub folders by creation date. If a photo with the same file name already exists in the folder, or has been deleted from the folder before, it will not be saved again."
+						)
+					}
 				}
 			}
 
@@ -174,7 +196,7 @@ struct PhotoBackupSettingsView: View {
 					Toggle(
 						"Copy photos periodically in the background",
 						isOn: photoBackup.$enableBackgroundCopy
-					).disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
+					).disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
 				}
 			#endif
 
@@ -187,7 +209,7 @@ struct PhotoBackupSettingsView: View {
 							photoBackup.categories.toggle(.photo, s)
 						})
 				)
-				.disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
+				.disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
 				.onChange(of: photoBackup.categories) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
 
 				Toggle(
@@ -197,7 +219,7 @@ struct PhotoBackupSettingsView: View {
 						set: { s in
 							photoBackup.categories.toggle(.livePhoto, s)
 						})
-				).disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
+				).disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
 
 				Toggle(
 					"Videos",
@@ -206,131 +228,158 @@ struct PhotoBackupSettingsView: View {
 						set: { s in
 							photoBackup.categories.toggle(.video, s)
 						})
-				).disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
+				).disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
 			}
 
-			Section {
-				LabeledContent {
-					TextField("", text: photoBackup.$subDirectoryPath, prompt: Text("(Top level)"))
-						.multilineTextAlignment(.trailing)
-						#if os(iOS)
-							.keyboardType(.asciiCapable)
-							.autocorrectionDisabled()
-							.autocapitalization(.none)
-						#endif
-						.onChange(of: photoBackup.subDirectoryPath) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-				} label: {
-					Text("Path in folder")
-				}
-
-				PhotoFolderStructureView(folderStructure: photoBackup.$folderStructure)
-					.disabled(photoBackup.isBackingUp)
-					.onChange(of: photoBackup.folderStructure) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-
-				Text("Example file location in folder: ")
-					+ Text("\(photoBackup.subDirectoryPath)/\(photoBackup.folderStructure.examplePath)")
-					.monospaced()
-
-			} footer: {
-				Text(
-					"When the folder structure is changed, photos that were already saved will be saved again in their new location."
-				)
-			}
-
-			if photoBackup.folderStructure.usesTimeZone {
+			// Folder structure settings (only in manual mode)
+			if !photoBackup.autoModeEnabled {
 				Section {
-					PhotoBackupTimeZoneView(timeZone: photoBackup.$timeZone)
-						.disabled(photoBackup.isBackingUp)
-						.onChange(of: photoBackup.timeZone) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-				} footer: {
-					PhotoBackupTimeZoneExplainerView(timeZone: photoBackup.timeZone)
-				}
-			}
-
-			Section {
-				Picker("Add to album", selection: $photoBackup.savedAlbumID) {
-					Text("None").tag("")
-					ForEach(albums, id: \.localIdentifier) { album in
-						Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
+					LabeledContent {
+						TextField("", text: photoBackup.$subDirectoryPath, prompt: Text("(Top level)"))
+							.multilineTextAlignment(.trailing)
+							#if os(iOS)
+								.keyboardType(.asciiCapable)
+								.autocorrectionDisabled()
+								.autocapitalization(.none)
+							#endif
+							.onChange(of: photoBackup.subDirectoryPath) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+					} label: {
+						Text("Path in folder")
 					}
-				}
-				.pickerStyle(.menu)
-				.disabled(
-					photoBackup.isBackingUp || self.authorizationStatus != .authorized
-						|| photoBackup.selectedAlbumID.isEmpty
-				)
-				.onChange(of: photoBackup.savedAlbumID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-			} header: {
-				Text("After saving")
-			} footer: {
-				if photoBackup.purgeEnabled && photoBackup.purgeAfterDays <= 0 {
+
+					PhotoFolderStructureView(folderStructure: photoBackup.$folderStructure)
+						.disabled(photoBackup.isBackingUp)
+						.onChange(of: photoBackup.folderStructure) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+
+					Text("Example file location in folder: ")
+						+ Text("\(photoBackup.subDirectoryPath)/\(photoBackup.folderStructure.examplePath)")
+						.monospaced()
+
+				} footer: {
 					Text(
-						"Because of the setting below to immediately delete photos after saving, newly saved photos will not be added to this album."
+						"When the folder structure is changed, photos that were already saved will be saved again in their new location."
 					)
 				}
+
+				if photoBackup.folderStructure.usesTimeZone {
+					Section {
+						PhotoBackupTimeZoneView(timeZone: photoBackup.$timeZone)
+							.disabled(photoBackup.isBackingUp)
+							.onChange(of: photoBackup.timeZone) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+					} footer: {
+						PhotoBackupTimeZoneExplainerView(timeZone: photoBackup.timeZone)
+					}
+				}
 			}
 
-			Section {
-				Toggle("Remove saved photos from source", isOn: photoBackup.$purgeEnabled)
-					.onChange(of: photoBackup.purgeEnabled) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
-
-				if photoBackup.purgeEnabled {
-					Stepper(
-						photoBackup.purgeAfterDays <= 0
-							? "Immediately" : "After \(photoBackup.purgeAfterDays) days",
-						value: photoBackup.$purgeAfterDays, in: 0...30)
+			// "Add to album" setting (only in manual mode)
+			if !photoBackup.autoModeEnabled {
+				Section {
+					Picker("Add to album", selection: $photoBackup.savedAlbumID) {
+						Text("None").tag("")
+						ForEach(albums, id: \.localIdentifier) { album in
+							Text(album.localizedTitle ?? "Unknown album").tag(album.localIdentifier)
+						}
+					}
+					.pickerStyle(.menu)
+					.disabled(
+						photoBackup.isBackingUp || self.authorizationStatus != .authorized
+							|| photoBackup.selectedFolderID.isEmpty
+					)
+					.onChange(of: photoBackup.savedAlbumID) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+				} header: {
+					Text("After saving")
+				} footer: {
+					if photoBackup.purgeEnabled && photoBackup.purgeAfterDays <= 0 {
+						Text(
+							"Because of the setting below to immediately delete photos after saving, newly saved photos will not be added to this album."
+						)
+					}
 				}
-			} footer: {
-				if photoBackup.purgeEnabled {
-					if photoBackup.purgeAfterDays <= 0 {
-						Text("Photos will be automatically removed from your photo library and iCloud after they have been backed up.")
+			}
+
+			// "Purge" setting (both auto and manual modes) - now in advanced options
+			if showAdvancedOptions {
+				Section {
+					Toggle("Remove saved photos from source", isOn: photoBackup.$purgeEnabled)
+						.onChange(of: photoBackup.purgeEnabled) { _, _ in photoBackup.resetLastSuccessfulChangeToken() }
+
+					if photoBackup.purgeEnabled {
+						Stepper(
+							photoBackup.purgeAfterDays <= 0
+								? "Immediately" : "After \(photoBackup.purgeAfterDays) days",
+							value: photoBackup.$purgeAfterDays, in: 0...30)
+					}
+				} header: {
+					Text("Auto-delete")
+				} footer: {
+					if photoBackup.purgeEnabled {
+						if photoBackup.purgeAfterDays <= 0 {
+							Text("Photos will be automatically removed from your photo library and iCloud after they have been backed up.")
+						}
+						else {
+							Text(
+								"Photos will be automatically removed from your photo library and iCloud \(photoBackup.purgeAfterDays) days after they have been backed up."
+							)
+						}
 					}
 					else {
 						Text(
-							"Photos will be automatically removed from your photo library and iCloud \(photoBackup.purgeAfterDays) days after they have been backed up."
+							"When this option is enabled, photos will be automatically removed from your photo library and iCloud after they have been backed up."
 						)
 					}
-				}
-				else {
+
+					#if os(iOS)
+						if photoBackup.purgeEnabled && photoBackup.enableBackgroundCopy {
+							Text(
+								"Photos will only be removed when photo back-up is started manually from inside the app."
+							)
+						}
+					#endif
+				}.disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
+
+				Section {
+					Toggle(
+						"Do not save photos older than six months",
+						isOn: Binding(
+							get: {
+								photoBackup.maxAgeDays > 0
+							},
+							set: {
+								photoBackup.maxAgeDays = $0 ? 180 : 0
+							}))
+				} footer: {
 					Text(
-						"When this option is enabled, photos will be automatically removed from your photo library and iCloud after they have been backed up."
+						"If you delete photos from the folder, this will be remembered for six months, so they will not be saved to the folder again during this time. Enable this setting to prevent these photos from being exported again after six months."
 					)
-				}
+				}.disabled(photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty)
 
-				#if os(iOS)
-					if photoBackup.purgeEnabled && photoBackup.enableBackgroundCopy {
-						Text(
-							"Photos will only be removed when photo back-up is started manually from inside the app."
-						)
+				// Live photo extension selector
+				Section {
+					Picker("Live photo file extension", selection: $photoBackup.livePhotoReplaceExtension) {
+						Text(".HEIC.MOV").tag(false)
+						Text(".MOV").tag(true)
 					}
-				#endif
-			}.disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
-
-			Section {
-				Toggle(
-					"Do not save photos older than six months",
-					isOn: Binding(
-						get: {
-							photoBackup.maxAgeDays > 0
-						},
-						set: {
-							photoBackup.maxAgeDays = $0 ? 180 : 0
-						}))
-			} footer: {
-				Text(
-					"If you delete photos from the folder, this will be remembered for six months, so they will not be saved to the folder again during this time. Enable this setting to prevent these photos from being exported again after six months."
-				)
-			}.disabled(photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty)
-
-			// Live photo extension selector
-			Section {
-				Picker("Live photo file extension", selection: $photoBackup.livePhotoReplaceExtension) {
-					Text(".HEIC.MOV").tag(false)
-					Text(".MOV").tag(true)
+					.pickerStyle(.menu)
+					.disabled(
+						photoBackup.isBackingUp || photoBackup.selectedFolderID.isEmpty || !photoBackup.categories.contains(.livePhoto))
 				}
-				.pickerStyle(.menu)
-				.disabled(
-					photoBackup.isBackingUp || photoBackup.selectedAlbumID.isEmpty || !photoBackup.categories.contains(.livePhoto))
+			}
+
+			// Advanced options toggle
+			Section {
+				Button {
+					withAnimation {
+						showAdvancedOptions.toggle()
+					}
+				} label: {
+					HStack {
+						Text("Advanced options")
+						Spacer()
+						Image(systemName: showAdvancedOptions ? "chevron.up" : "chevron.down")
+							.foregroundStyle(.secondary)
+					}
+				}
 			}
 
 			// Action buttons

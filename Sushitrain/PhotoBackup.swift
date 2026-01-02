@@ -105,6 +105,7 @@ enum PhotoBackupFolderStructure: String, Codable {
 enum PhotoBackupProgress {
 	case notStarted
 	case starting
+	case exportingAlbum(String, Int, Int) // album name, current index, total albums
 	case exportingPhotos(index: Int, total: Int, current: String?)
 	case exportingVideos(index: Int, total: Int, current: String?)
 	case exportingLivePhotos(index: Int, total: Int, current: String?)
@@ -117,14 +118,16 @@ enum PhotoBackupProgress {
 		switch self {
 		case .notStarted: return 1.0
 		case .starting: return 0.0
-
-		case .exportingPhotos(let index, let total, current: _):
+		case .exportingAlbum(_, let current, let total):
+			if total > 0 { return Float(current) / Float(total) }
+			return 0.0
+		case .exportingPhotos(let index, let total, _):
 			if total > 0 { return Float(index) / Float(total) }
 			return 1.0
-		case .exportingVideos(let index, let total, current: _):
+		case .exportingVideos(let index, let total, _):
 			if total > 0 { return Float(index) / Float(total) }
 			return 1.0
-		case .exportingLivePhotos(let index, let total, current: _):
+		case .exportingLivePhotos(let index, let total, _):
 			if total > 0 { return Float(index) / Float(total) }
 			return 1.0
 		case .selecting: return 0.0
@@ -138,9 +141,10 @@ enum PhotoBackupProgress {
 		switch self {
 		case .notStarted: return ""
 		case .starting: return ""
-		case .exportingPhotos(let index, let total, current: _): return String(localized: "\(index+1) of \(total)")
-		case .exportingVideos(let index, let total, current: _): return String(localized: "\(index+1) of \(total)")
-		case .exportingLivePhotos(let index, let total, current: _): return String(localized: "\(index+1) of \(total)")
+		case .exportingAlbum(_, let current, let total): return String(localized: "\(current) of \(total)")
+		case .exportingPhotos(let index, let total, _): return String(localized: "\(index+1) of \(total)")
+		case .exportingVideos(let index, let total, _): return String(localized: "\(index+1) of \(total)")
+		case .exportingLivePhotos(let index, let total, _): return String(localized: "\(index+1) of \(total)")
 		case .purging: return ""
 		case .selecting: return ""
 		case .error(_): return ""
@@ -152,9 +156,10 @@ enum PhotoBackupProgress {
 		switch self {
 		case .notStarted: return String(localized: "Not started")
 		case .starting: return String(localized: "Preparing to save photos and videos")
-		case .exportingPhotos(index: _, total: _, current: _): return String(localized: "Saving photos")
-		case .exportingVideos(index: _, total: _, current: _): return String(localized: "Saving videos")
-		case .exportingLivePhotos(index: _, total: _, current: _): return String(localized: "Saving live photos")
+		case .exportingAlbum(let albumName, _, _): return String(localized: "Saving album: \(albumName)")
+		case .exportingPhotos(index: _, total: _, _): return String(localized: "Saving photos")
+		case .exportingVideos(index: _, total: _, _): return String(localized: "Saving videos")
+		case .exportingLivePhotos(index: _, total: _, _): return String(localized: "Saving live photos")
 		case .purging: return String(localized: "Removing originals")
 		case .selecting: return String(localized: "Selecting files to be synchronized")
 		case .error(let e):
@@ -168,10 +173,14 @@ enum PhotoBackupProgress {
 
 @MainActor class PhotoBackup: ObservableObject {
 	static nonisolated let allPhotosAlbumIdentifier = "_SUSHITRAIN_ALL_PHOTOS"
+	static nonisolated let autoModeAlbumIdentifier = "_SUSHITRAIN_AUTO_MODE"
 
 	// These settings are prefixed 'photoSync' because that is what the feature used to be called
 	@AppStorage("photoSyncSelectedAlbumID") var selectedAlbumID: String = ""
 	@AppStorage("photoSyncFolderID") var selectedFolderID: String = ""
+
+	// Auto mode: automatically backup all albums to subdirectories
+	@AppStorage("photoSyncAutoModeEnabled") var autoModeEnabled: Bool = false
 
 	// Album to put photos that have been saved in
 	@AppStorage("photoSyncSavedAlbumID") var savedAlbumID: String = ""
@@ -195,6 +204,9 @@ enum PhotoBackupProgress {
 	@Published private(set) var photoBackupTask: Task<(), Error>? = nil
 
 	var selectedAlbumTitle: String? {
+		if self.autoModeEnabled {
+			return String(localized: "All albums")
+		}
 		if !self.selectedAlbumID.isEmpty {
 			if let selectedAlbum = PHAssetCollection.fetchAssetCollections(
 				withLocalIdentifiers: [self.selectedAlbumID], options: nil
@@ -205,7 +217,12 @@ enum PhotoBackupProgress {
 		return nil
 	}
 
-	var isReady: Bool { return !self.selectedAlbumID.isEmpty && !self.selectedFolderID.isEmpty }
+	var isReady: Bool {
+		if autoModeEnabled {
+			return !self.selectedFolderID.isEmpty
+		}
+		return !self.selectedAlbumID.isEmpty && !self.selectedFolderID.isEmpty
+	}
 
 	@MainActor func cancel() {
 		self.photoBackupTask?.cancel()
@@ -215,13 +232,13 @@ enum PhotoBackupProgress {
 	@discardableResult
 	@MainActor func backup(appState: AppState, fullExport: Bool, isInBackground: Bool) -> Task<(), Error>? {
 		if !self.isReady { return nil }
-		if self.selectedAlbumID.isEmpty { return nil }
 		if self.photoBackupTask != nil { return nil }
 		self.isBackingUp = true
 
 		let selectedAlbumID = self.selectedAlbumID
 		let selectedFolderID = self.selectedFolderID
 		let categories = self.categories
+		let autoMode = self.autoModeEnabled
 
 		// Start the actual synchronization task
 		self.photoBackupTask = Task.detached(priority: .background) {
@@ -323,34 +340,98 @@ enum PhotoBackupProgress {
 			}
 
 			let folderURL = URL(fileURLWithPath: folderPath)
-			let fetchResult: PHFetchResult<PHAssetCollection>
-			if selectedAlbumID == PhotoBackup.allPhotosAlbumIdentifier {
-				fetchResult = PHAssetCollection.fetchAssetCollections(
-					with: .smartAlbum, subtype: .smartAlbumUserLibrary, options: nil)
+
+			// Auto mode: backup all albums to subdirectories
+			if autoMode {
+				// Fetch all user albums and smart albums
+				let userAlbums = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .albumRegular, options: nil)
+				let smartAlbums = PHAssetCollection.fetchAssetCollections(with: .smartAlbum, subtype: .any, options: nil)
+
+				var albums: [PHAssetCollection] = []
+				userAlbums.enumerateObjects { collection, _, _ in albums.append(collection) }
+				smartAlbums.enumerateObjects { collection, _, _ in
+					let title = collection.localizedTitle ?? ""
+					// Skip "Recently Deleted" and "Hidden" albums
+					if !["最近删除", "已隐藏", "Recently Deleted", "Hidden"].contains(title) {
+						albums.append(collection)
+					}
+				}
+
+				Log.info("Auto mode: backing up \(albums.count) albums")
+
+				let albumCount = albums.count
+				for (index, album) in albums.enumerated() {
+					if Task.isCancelled { break }
+
+					let albumName = (album.localizedTitle ?? "Unknown").trimmingCharacters(in: .whitespacesAndNewlines)
+					// Sanitize album name to prevent filesystem issues
+					let invalidChars = CharacterSet(charactersIn: ":/\\?*|\"<>")
+					let sanitizedAlbumName = albumName.components(separatedBy: invalidChars).joined(separator: "_")
+
+					// Skip if album name is empty after sanitization
+					if sanitizedAlbumName.isEmpty {
+						Log.warn("Skipping album with invalid name: \(albumName)")
+						continue
+					}
+
+					DispatchQueue.main.async {
+						self.progress = .exportingAlbum(sanitizedAlbumName, index, albumCount)
+					}
+
+					// Create subdirectory for this album
+					let albumSubDir = EntryPath(sanitizedAlbumName, isDirectory: true)
+					let albumSubDirURL = folderURL.appendingPathComponent(sanitizedAlbumName)
+					try FileManager.default.createDirectory(at: albumSubDirURL, withIntermediateDirectories: true)
+
+					try await self.backupAlbum(
+						appState: appState,
+						album: album,
+						folder: folder,
+						folderURL: folderURL,
+						subDirectoryPath: albumSubDir,
+						fullExport: fullExport,
+						categories: categories,
+						isInBackground: isInBackground,
+						onlyTheseLocalIdentifiers: nil
+					)
+				}
+
+				DispatchQueue.main.async {
+					self.progress = .finished(savedAssets: nil, purgedAssets: nil)
+					self.lastCompletedDate = Date.now.timeIntervalSinceReferenceDate
+				}
 			}
 			else {
-				fetchResult = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [selectedAlbumID], options: nil)
-			}
-			guard let album = fetchResult.firstObject else {
-				DispatchQueue.main.async { self.progress = .error(String(localized: "Could not find selected album")) }
-				return
-			}
+				// Manual mode: backup single album
+				let fetchResult: PHFetchResult<PHAssetCollection>
+				if selectedAlbumID == PhotoBackup.allPhotosAlbumIdentifier {
+					fetchResult = PHAssetCollection.fetchAssetCollections(
+						with: .smartAlbum, subtype: .smartAlbumUserLibrary, options: nil)
+				}
+				else {
+					fetchResult = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [selectedAlbumID], options: nil)
+				}
+				guard let album = fetchResult.firstObject else {
+					DispatchQueue.main.async { self.progress = .error(String(localized: "Could not find selected album")) }
+					return
+				}
 
-			try await self.backupAlbum(
-				appState: appState,
-				album: album,
-				folder: folder,
-				folderURL: folderURL,
-				subDirectoryPath: subDirectoryPath,
-				fullExport: fullExport,
-				categories: categories,
-				isInBackground: isInBackground,
-				onlyTheseLocalIdentifiers: onlyTheseLocalIdentifiers
-			)
+				try await self.backupAlbum(
+					appState: appState,
+					album: album,
+					folder: folder,
+					folderURL: folderURL,
+					subDirectoryPath: subDirectoryPath,
+					fullExport: fullExport,
+					categories: categories,
+					isInBackground: isInBackground,
+					onlyTheseLocalIdentifiers: onlyTheseLocalIdentifiers
+				)
 
-			// Save change token
-			DispatchQueue.main.async {
-				self.lastSuccessfulChangeToken = changeToken
+				// Save change token
+				DispatchQueue.main.async {
+					self.lastSuccessfulChangeToken = changeToken
+				}
 			}
 		}
 		return self.photoBackupTask
